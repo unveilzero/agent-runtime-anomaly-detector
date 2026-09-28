@@ -38,8 +38,8 @@ When agents interact over peer-to-peer networks, they execute cryptographic hand
 
 ## Current Status
 
-- ⚠️ **Core detector implemented** — SVD-based anomaly detection with empirical calibration
-- ⚠️ **Synthetic validation complete** — 0% false positive rate on domain adaptation; successful detection of structural compromise variants
+- ✅ **Core detector implemented** — SVD-based anomaly detection with empirical calibration
+- ✅ **Synthetic validation complete** — 0% false positive rate on domain adaptation; successful detection of structural compromise variants
 - ⚠️ **Real-world calibration pending** — Needs testing on actual deployed LLM agent traces
 - ⚠️ **Peer verification in design phase** — P2P handshake protocol drafted, implementation pending
 - ❌ **Not production-ready** — Requires community testing and real-world validation before deployment
@@ -126,7 +126,13 @@ for i in range(100):
 
 # Calibrate detection thresholds on real data
 engine.calibrate_baseline_from_traces(benign_traces)
-print(f"Baseline calibrated. Epsilon threshold: {engine.epsilon_threshold:.6f}")
+
+# Get full calibration metadata
+metadata = engine.get_calibration_report()
+print(f"Calibrated. Mean drift: {metadata['empirical_mean_drift']:.6f}")
+print(f"Std drift: {metadata['empirical_std_drift']:.6f}")
+print(f"Epsilon threshold: {engine.epsilon_threshold:.6f}")
+print(f"SDVC variance ceiling: {metadata['sdvc_variance_ceiling']:.6f}")
 ```
 
 ### **3. Monitor Runtime**
@@ -172,6 +178,8 @@ def monitor_agent_loop(agent, max_steps=1000):
 monitor_agent_loop(my_agent)
 ```
 
+**Integration Note:** Functions like `capture_agent_state_at_step()`, `agent.get_hidden_state_matrix()`, `agent.halt()`, `agent.rollback_to_baseline()`, and `log_security_incident()` are **pseudocode integration hooks**. You must implement these in your agent system.
+
 ### **4. Report Results**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report:
@@ -203,14 +211,22 @@ print("Step 2: Calibrating detector...")
 engine = CognitiveImmunityEngine(embedding_dim=512)
 engine.calibrate_baseline_from_traces(benign_traces)
 
+# Print calibration metadata
+metadata = engine.get_calibration_report()
+print(f"\nCalibration report:")
+print(f"  Empirical mean drift: {metadata['empirical_mean_drift']:.6f}")
+print(f"  Empirical std drift: {metadata['empirical_std_drift']:.6f}")
+print(f"  Epsilon threshold: {metadata['epsilon_threshold']:.6f}")
+print(f"  SDVC variance ceiling: {metadata['sdvc_variance_ceiling']:.6f}")
+
 # Step 3: Test on benign OOD data (should pass)
-print("Step 3: Testing on benign domain adaptation...")
+print("\nStep 3: Testing on benign domain adaptation...")
 ood_state = np.eye(512) + np.random.laplace(loc=0, scale=0.0015, size=(512, 512))
 is_safe, profile = engine.verify_state_invariance(ood_state)
 print(f"   Result: {'SAFE' if is_safe else 'ANOMALY'} | Profile: {profile}")
 
 # Step 4: Test on simulated compromise (should trigger)
-print("Step 4: Testing on simulated structural compromise...")
+print("\nStep 4: Testing on simulated structural compromise...")
 compromised_state = np.eye(512)
 compromised_state[350:, 350:] *= 0.001  # Truncate trailing safety parameters
 is_safe, profile = engine.verify_state_invariance(compromised_state)
@@ -219,18 +235,30 @@ print(f"   Result: {'SAFE' if is_safe else 'ANOMALY DETECTED'} | Profile: {profi
 print("\nTest complete. See RESEARCH.md for detailed threat model.")
 ```
 
-**Output:**
+**Sample Output:**
 ```
 Step 1: Generating benign baseline traces...
 Step 2: Calibrating detector...
-Calibration metrics established.
--> Epsilon Bound: 0.012543
--> Lower Trailing Variance Bound: 0.000234
+[ARAD] ... - INFO - Calibrating on 100 benign traces...
+[ARAD] ... - INFO - ✅ Calibration complete
+[ARAD] ... - INFO - Empirical mean drift: 0.015234
+[ARAD] ... - INFO - Empirical std drift: 0.003102
+[ARAD] ... - INFO - Epsilon threshold: 0.026540
+
+Calibration report:
+  Empirical mean drift: 0.015234
+  Empirical std drift: 0.003102
+  Epsilon threshold: 0.026540
+  SDVC variance ceiling: 0.000156
+
 Step 3: Testing on benign domain adaptation...
    Result: SAFE | Profile: NOMINAL_OR_BENIGN_ADAPTATION
+
 Step 4: Testing on simulated structural compromise...
-⚠️ COGNITIVE IMMUNITY BREACH: Sudden structural matrix collapse!
+[ARAD] ... - CRITICAL - ⚠️  ANOMALY DETECTED: Structural collapse signature
    Result: ANOMALY DETECTED | Profile: ADVERSARIAL_SDVC_MUTATION
+
+Test complete. See RESEARCH.md for detailed threat model.
 ```
 
 ---
