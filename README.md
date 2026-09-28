@@ -38,8 +38,8 @@ When agents interact over peer-to-peer networks, they execute cryptographic hand
 
 ## Current Status
 
-- ✅ **Core detector implemented** — SVD-based anomaly detection with empirical calibration
-- ✅ **Synthetic validation complete** — 0% false positive rate on domain adaptation; successful detection of structural compromise variants
+- ⚠️ **Core detector implemented** — SVD-based anomaly detection with empirical calibration
+- ⚠️ **Synthetic validation complete** — 0% false positive rate on domain adaptation; successful detection of structural compromise variants
 - ⚠️ **Real-world calibration pending** — Needs testing on actual deployed LLM agent traces
 - ⚠️ **Peer verification in design phase** — P2P handshake protocol drafted, implementation pending
 - ❌ **Not production-ready** — Requires community testing and real-world validation before deployment
