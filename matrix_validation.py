@@ -68,11 +68,23 @@ class CognitiveImmunityEngine:
         """
         Calibrates trusted boundaries using historical trace logs from agents
         operating nominal parameters over extended observation windows.
+        
+        CALIBRATION ATTACK DEFENSES:
+        - MIN_CALIBRATION_TRACES: Prevents history_window shrinking attacks
+        - Epsilon sanity check: Catches artificially inflated thresholds
         """
         self.ensure_environment_integrity()
 
         if not benign_traces:
             raise ValueError("Calibration requires a non-empty list of historical agent traces.")
+
+        # DEFENSE: Prevent history_window shrinking attack
+        MIN_CALIBRATION_TRACES = 50
+        if len(benign_traces) < MIN_CALIBRATION_TRACES:
+            raise RuntimeError(
+                f"Insufficient calibration data. Minimum {MIN_CALIBRATION_TRACES} traces required. "
+                f"Received {len(benign_traces)}. Possible calibration poisoning attempt (history_window shrink attack)."
+            )
 
         logger.info(f"Calibrating system telemetry baseline using {len(benign_traces)} historical traces...")
 
@@ -121,6 +133,18 @@ class CognitiveImmunityEngine:
         mean_energy_ratio = np.mean(energy_ratios)
         std_energy_ratio = np.std(energy_ratios)
         self.energy_ratio_floor = float(mean_energy_ratio - (3 * std_energy_ratio))
+
+        # DEFENSE: Sanity check for calibration poisoning
+        # Suspiciously high epsilon suggests shrunk history window or poisoned benign data
+        EPSILON_SANITY_LIMIT = 0.15
+        if self.epsilon_threshold > EPSILON_SANITY_LIMIT:
+            logger.critical(
+                f"🚨 CALIBRATION ATTACK DETECTED: epsilon_threshold={self.epsilon_threshold:.6f} exceeds safety limit {EPSILON_SANITY_LIMIT}. "
+                f"Possible benign trace contamination or history_window manipulation attack."
+            )
+            raise RuntimeError(
+                "Calibration baseline validation failed. Suspected history window manipulation or poisoned benign traces."
+            )
 
         self.calibrated = True
         logger.info("✅ Baseline calibration complete. System safety bounds locked.")
