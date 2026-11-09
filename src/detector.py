@@ -21,7 +21,7 @@ class CognitiveImmunityEngine:
     """Runtime anomaly detector for autonomous agent state monitoring."""
 
     def __init__(self, embedding_dim: int = 512, audit_log_path: str = None):
-        if embedding_dim < 2 or not isinstance(embedding_dim, int):
+        if not isinstance(embedding_dim, int) or embedding_dim < 2:
             raise ValueError("embedding_dim must be an integer >= 2")
 
         self.embedding_dim = embedding_dim

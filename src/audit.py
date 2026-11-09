@@ -6,6 +6,7 @@ periodic checkpoints to external append-only storage and keep one writer per log
 """
 
 import hashlib
+import hmac
 import json
 import os
 import threading
@@ -19,8 +20,6 @@ class AuditLog:
     def __init__(self, path):
         self.path = Path(path)
         self._lock = threading.Lock()
-        self._sequence = 0
-        self._head_hash = "0" * 64
         self._sequence, self._head_hash = self._read_and_validate()
 
     @staticmethod
@@ -47,7 +46,7 @@ class AuditLog:
                 record = dict(payload)
                 record.pop("chain_hash", None)
                 expected_hash = hashlib.sha256(self._canonical(record).encode("utf-8")).hexdigest()
-                if not hashlib.compare_digest(chain_hash, expected_hash):
+                if not hmac.compare_digest(chain_hash, expected_hash):
                     raise ValueError(f"Audit hash mismatch at line {line_number}")
                 if record.get("previous_hash") != previous_hash:
                     raise ValueError(f"Broken audit chain at line {line_number}")
