@@ -1,1046 +1,118 @@
-"""
-OASF-BEA Master Architecture (v1.6.0) - Environment Integrity Validator
-Component: Pre-flight execution environment security audit
-License: Open Framework Public Specification (BEA-CAP-1.0)
+"""Environment preflight checks.
 
-CRITICAL: This module validates that the execution environment has not been 
-poisoned via dependency injection, library replacement, or environment variable 
-tampering before running the CognitiveImmunityEngine detector.
+This is a preflight integrity check, not a complete external monitor. It verifies
+that the in-process environment has not drifted from an earlier baseline, but it
+cannot prove there are no side effects outside the Python process itself.
 """
 
 import hashlib
-import importlib.util
 import json
 import logging
 import os
 import sys
-import time
-from pathlib import Path
 
-logging.basicConfig(level=logging.INFO, format='[OASF-ENV-VALIDATOR] %(asctime)s - %(levelname)s - %(message)s')
+from src.audit import AuditLog
+
 logger = logging.getLogger("OASF_Environment_Validator")
 
 
 class EnvironmentIntegrityValidator:
-    """
-    Pre-flight environment security checkpoint.
-    
-    Captures cryptographic fingerprints of critical loaded libraries and 
-    environment variables. Detects poisoning via dependency injection, 
-    library replacement, or environment variable tampering (CVE-2026-22708).
-    """
-    
-    # Critical modules that must be verified before detector runs
-    CRITICAL_MODULES = ['numpy', 'scipy']
-    
-    # Safe environment variable baselines (system-dependent, user-configurable)
-    SAFE_ENV_VARS = {
-        'PATH': None,
-        'PYTHONPATH': None,
-        'LD_LIBRARY_PATH': None,
-    }
-    
-    def __init__(self, safe_env_vars: dict = None, audit_log_path: str = None):
-        """
-        Initialize environment validator with optional custom environment baseline.
-        
-        :param safe_env_vars: Dict of env var name -> expected value. If None, 
-                              current values are used as baseline.
-        :param audit_log_path: Optional path for tamper-evident audit logs.
-        """
+    """Fingerprint selected loaded modules and environment variables."""
+
+    CRITICAL_MODULES = ("numpy", "scipy")
+    SAFE_ENV_VARS = {"PATH": None, "PYTHONPATH": None, "LD_LIBRARY_PATH": None}
+
+    def __init__(self, safe_env_vars=None, audit_log_path=None):
         self.baseline_imports = {}
         self.baseline_env_vars = {}
-        self.audit_chain = ""
-        self.audit_log_path = Path(audit_log_path) if audit_log_path else Path(".arad_audit.log")
         self.environment_manifest = {}
-        
+        self._safe_env_vars = dict(self.SAFE_ENV_VARS)
         if safe_env_vars:
-            self.SAFE_ENV_VARS.update(safe_env_vars)
-
+            self._safe_env_vars.update(safe_env_vars)
+        self.audit_log = AuditLog(audit_log_path or ".arad_environment_audit.jsonl")
         self._record_event("validator_initialized", {
-            "critical_modules": self.CRITICAL_MODULES,
-            "safe_env_vars": list(self.SAFE_ENV_VARS.keys()),
-            "audit_log_path": str(self.audit_log_path),
+            "critical_modules": list(self.CRITICAL_MODULES),
+            "safe_env_vars": sorted(self._safe_env_vars),
         })
-        logger.info("Environment Integrity Validator initialized.")
 
-    def _record_event(self, event_type: str, details: dict):
-        """Append a tamper-evident event to the audit log."""
-        record = {
-            "ts": int(time.time()),
-            "event": event_type,
-            "details": details,
-            "previous_hash": self.audit_chain,
-        }
-        payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        chain_hash = hashlib.sha256((self.audit_chain + payload).encode("utf-8")).hexdigest()
-        record["chain_hash"] = chain_hash
-        self.audit_chain = chain_hash
-
+    def _record_event(self, event_type, details):
         try:
-            with open(self.audit_log_path, 'a', encoding='utf-8') as handle:
-                handle.write(json.dumps(record, sort_keys=True) + '\n')
-        except OSError as exc:
-            logger.warning(f"Unable to write environment audit log: {exc}")
+            self.audit_log.append(event_type, details)
+        except (OSError, ValueError):
+            logger.exception("Environment audit logging failed")
 
     def snapshot_environment(self):
-        """
-        Capture cryptographic fingerprints of loaded critical libraries
-        and environment variable state at baseline time.
-        """
-        logger.info("Capturing environment baseline snapshot...")
         self.baseline_imports = {}
-        self.baseline_env_vars = {}
-        
         for module_name in self.CRITICAL_MODULES:
-            if module_name in sys.modules:
-                module = sys.modules[module_name]
-                module_path = getattr(module, '__file__', None)
-                
-                if module_path:
-                    try:
-                        with open(module_path, 'rb') as f:
-                            module_hash = hashlib.sha256(f.read()).hexdigest()
-                        self.baseline_imports[module_name] = {
-                            'path': module_path,
-                            'hash': module_hash
-                        }
-                        logger.info(f"✅ Fingerprinted {module_name}: {module_hash[:16]}...")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Could not fingerprint {module_name}: {e}")
-                else:
-                    logger.warning(f"⚠️  Could not locate {module_name} file path.")
-        
-        for var_name in self.SAFE_ENV_VARS.keys():
-            self.baseline_env_vars[var_name] = os.environ.get(var_name, '')
-            logger.info(f"✅ Captured env var {var_name} = {self.baseline_env_vars[var_name][:50]}...")
+            module = sys.modules.get(module_name)
+            module_path = getattr(module, "__file__", None) if module else None
+            if not module_path:
+                continue
+            try:
+                with open(module_path, "rb") as handle:
+                    module_hash = hashlib.sha256(handle.read()).hexdigest()
+                self.baseline_imports[module_name] = {"path": module_path, "hash": module_hash}
+            except OSError as exc:
+                logger.warning("Could not fingerprint %s: %s", module_name, exc)
 
+        self.baseline_env_vars = {name: os.environ.get(name, "") for name in self._safe_env_vars}
+        manifest = {"imports": self.baseline_imports, "env": self.baseline_env_vars}
         self.environment_manifest = {
-            "critical_modules": list(self.baseline_imports.keys()),
             "module_fingerprints": self.baseline_imports,
-            "env_vars": self.baseline_env_vars,
-            "baseline_hash": hashlib.sha256(
-                json.dumps({
-                    "imports": self.baseline_imports,
-                    "env": self.baseline_env_vars,
-                }, sort_keys=True).encode("utf-8")
-            ).hexdigest(),
+            "env_var_names": sorted(self.baseline_env_vars),
+            "baseline_hash": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest(),
         }
-
         self._record_event("environment_snapshot", self.environment_manifest)
-        logger.info("✅ Environment baseline snapshot complete.")
+        return dict(self.environment_manifest)
 
-    def verify_environment(self) -> bool:
-        """
-        Verify that loaded libraries and environment variables match baseline.
-        
-        Returns True if environment is clean, False if poisoning detected.
-        Raises RuntimeError on critical failure.
-        """
-        logger.info("Running environment integrity verification...")
+    def verify_environment(self):
+        if not self.environment_manifest:
+            raise RuntimeError("Call snapshot_environment() before verify_environment().")
 
-        for module_name, baseline_info in self.baseline_imports.items():
-            if module_name not in sys.modules:
-                logger.critical(f"🚨 CRITICAL: Module {module_name} was unloaded. Possible sabotage.")
-                self._record_event("environment_mismatch", {
-                    "module": module_name,
-                    "reason": "module_unloaded",
-                })
-                return False
-            
-            module = sys.modules[module_name]
-            actual_path = getattr(module, '__file__', None)
-            baseline_path = baseline_info['path']
-            baseline_hash = baseline_info['hash']
-
-            if actual_path != baseline_path:
-                logger.critical(
-                    f"🚨 CRITICAL: {module_name} loaded from different path.\n"
-                    f"   Expected: {baseline_path}\n"
-                    f"   Actual: {actual_path}\n"
-                    f"   Possible library injection or environment poisoning."
-                )
+        for module_name, baseline in self.baseline_imports.items():
+            module = sys.modules.get(module_name)
+            actual_path = getattr(module, "__file__", None) if module else None
+            if actual_path != baseline["path"]:
                 self._record_event("environment_mismatch", {
                     "module": module_name,
                     "reason": "path_mismatch",
-                    "expected_path": baseline_path,
                     "actual_path": actual_path,
                 })
                 return False
-
             try:
-                with open(actual_path, 'rb') as f:
-                    actual_hash = hashlib.sha256(f.read()).hexdigest()
-                
-                if actual_hash != baseline_hash:
-                    logger.critical(
-                        f"🚨 CRITICAL: {module_name} binary mismatch (poisoning detected).\n"
-                        f"   Expected hash: {baseline_hash}\n"
-                        f"   Actual hash: {actual_hash}\n"
-                        f"   Module path: {actual_path}"
-                    )
-                    self._record_event("environment_mismatch", {
-                        "module": module_name,
-                        "reason": "hash_mismatch",
-                        "expected_hash": baseline_hash,
-                        "actual_hash": actual_hash,
-                    })
-                    return False
-                logger.info(f"✅ {module_name} binary verified: {actual_hash[:16]}...")
-            except Exception as e:
-                logger.critical(f"🚨 CRITICAL: Could not verify {module_name} binary: {e}")
+                with open(actual_path, "rb") as handle:
+                    actual_hash = hashlib.sha256(handle.read()).hexdigest()
+            except OSError as exc:
                 self._record_event("environment_mismatch", {
                     "module": module_name,
-                    "reason": "verification_error",
-                    "error": str(e),
+                    "reason": "read_error",
+                    "error": str(exc),
                 })
                 return False
-        
-        for var_name, baseline_value in self.baseline_env_vars.items():
-            actual_value = os.environ.get(var_name, '')
-            
-            if actual_value != baseline_value:
-                logger.critical(
-                    f"🚨 CRITICAL: Environment variable {var_name} corrupted (CVE-2026-22708).\n"
-                    f"   Expected: {baseline_value}\n"
-                    f"   Actual: {actual_value}\n"
-                    f"   Possible shell built-in bypass or prompt injection attack."
-                )
+            if actual_hash != baseline["hash"]:
                 self._record_event("environment_mismatch", {
-                    "variable": var_name,
-                    "reason": "env_var_mismatch",
-                    "expected": baseline_value,
-                    "actual": actual_value,
+                    "module": module_name,
+                    "reason": "hash_mismatch",
                 })
                 return False
-            logger.info(f"✅ Environment variable {var_name} verified.")
-        
+
+        for name, expected in self.baseline_env_vars.items():
+            if os.environ.get(name, "") != expected:
+                self._record_event("environment_mismatch", {
+                    "variable": name,
+                    "reason": "env_var_mismatch",
+                })
+                return False
+
         self._record_event("environment_verified", {
-            "baseline_hash": self.environment_manifest.get("baseline_hash"),
+            "baseline_hash": self.environment_manifest["baseline_hash"],
         })
-        logger.info("✅ Environment integrity verification PASSED.")
         return True
 
 
 if __name__ == "__main__":
     validator = EnvironmentIntegrityValidator()
     validator.snapshot_environment()
-    
-    if validator.verify_environment():
-        logger.info("✅ Safe to proceed with CognitiveImmunityEngine initialization.")
-    else:
-        logger.critical("❌ Environment compromised. Aborting detector initialization.")
+    if not validator.verify_environment():
+        logger.critical("Environment integrity check failed.")
         sys.exit(1)
-
-"""
-CognitiveImmunityEngine: Core anomaly detection module
-Based on SVD-driven structural invariance checking
-"""
-
-import hashlib
-import json
-import logging
-import time
-from typing import Tuple, List
-
-import numpy as np
-
-logging.basicConfig(level=logging.INFO, format='[ARAD] %(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ARAD_Detector")
-
-
-class CognitiveImmunityEngine:
-    """
-    Runtime anomaly detector for autonomous agent state monitoring.
-    Detects structural deviations that indicate compromise or self-modification.
-    """
-
-    def __init__(self, embedding_dim: int = 512, audit_log_path: str = None):
-        """
-        Initialize the detector.
-
-        Args:
-            embedding_dim: Dimensionality of agent state matrices (default 512)
-            audit_log_path: Optional path for tamper-evident event logging
-        """
-        self.embedding_dim = embedding_dim
-        self.audit_log_path = audit_log_path or ".arad_audit.log"
-        self.audit_chain = ""
-        self.baseline_manifest = {}
-        self.baseline_locked = False
-
-        # Calibration state
-        self.calibrated = False
-        self.T_shared = None
-        self.Sing_X = None
-
-        # Empirical calibration statistics
-        self.empirical_mean_drift = 0.0
-        self.empirical_std_drift = 0.0
-        self.trailing_var_mean = 0.0
-        self.trailing_var_std = 0.0
-
-        # Derived detector thresholds
-        self.variance_threshold_lower = 0.0
-        self.split_idx = int(self.embedding_dim * 0.7)  # 70/30 split for variance analysis
-
-        self._record_event("engine_initialized", {
-            "embedding_dim": self.embedding_dim,
-            "audit_log_path": self.audit_log_path,
-        })
-
-    @property
-    def epsilon_threshold(self) -> float:
-        """Computed threshold: mean + 3σ of empirical drift distribution."""
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine not yet calibrated. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-        return self.empirical_mean_drift + (3.0 * self.empirical_std_drift)
-
-    def _record_event(self, event_type: str, details: dict) -> None:
-        """Append a tamper-evident record derived from the current audit hash chain."""
-        record = {
-            "ts": int(time.time()),
-            "event": event_type,
-            "details": details,
-            "previous_hash": self.audit_chain,
-        }
-        payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        chain_hash = hashlib.sha256((self.audit_chain + payload).encode("utf-8")).hexdigest()
-        record["chain_hash"] = chain_hash
-        self.audit_chain = chain_hash
-
-        try:
-            with open(self.audit_log_path, 'a', encoding='utf-8') as handle:
-                handle.write(json.dumps(record, sort_keys=True) + '\n')
-        except OSError as exc:
-            logger.warning(f"Unable to write detector audit log: {exc}")
-
-    def calibrate_baseline_from_traces(self, benign_traces: List[np.ndarray]) -> None:
-        """
-        Calibrate detection thresholds from real benign agent traces.
-        This MUST be called before verify_state_invariance().
-
-        Args:
-            benign_traces: List of (embedding_dim, embedding_dim) state matrices from clean operation
-
-        Raises:
-            ValueError: If traces have invalid shape or insufficient data
-        """
-        if self.calibrated and self.baseline_locked:
-            raise RuntimeError(
-                "Baseline already locked. Recalibration would silently modify the trusted baseline; "
-                "start a new engine instance or explicitly reset the baseline state."
-            )
-
-        if not benign_traces:
-            raise ValueError("At least 1 benign trace required for calibration")
-
-        if len(benign_traces) < 10:
-            logger.warning(
-                f"Calibrating on only {len(benign_traces)} traces. "
-                f"Recommend 50+ for robust thresholds."
-            )
-
-        # Validate all traces
-        for i, trace in enumerate(benign_traces):
-            if trace.shape != (self.embedding_dim, self.embedding_dim):
-                raise ValueError(
-                    f"Trace {i} has shape {trace.shape}, expected "
-                    f"({self.embedding_dim}, {self.embedding_dim})"
-                )
-            if not np.all(np.isfinite(trace)):
-                raise ValueError(f"Trace {i} contains non-finite values (NaN or Inf)")
-
-        logger.info(f"Calibrating on {len(benign_traces)} benign traces...")
-
-        # 1. Derive Sing_X: average singular value profile from benign operation
-        svd_profiles = [np.linalg.svd(trace, compute_uv=False) for trace in benign_traces]
-        self.Sing_X = np.mean(svd_profiles, axis=0)
-
-        # 2. Compute T_shared: transformation matrix from covariance structure
-        C = np.zeros((self.embedding_dim, self.embedding_dim))
-        for trace in benign_traces:
-            C += trace @ trace.T
-        C /= len(benign_traces)
-
-        U_c, _, _ = np.linalg.svd(C)
-        self.T_shared = U_c  # Use left singular vectors as transformation
-
-        # 3. Compute drift statistics for threshold calibration
-        drift_norms = []
-        trailing_variances = []
-
-        for Sing_Y in svd_profiles:
-            expected_alignment = self.T_shared @ self.Sing_X
-            drift_delta = Sing_Y - expected_alignment
-
-            # Euclidean norm of drift vector
-            norm_val = np.linalg.norm(drift_delta)
-            drift_norms.append(norm_val)
-
-            # Variance in trailing dimensions (used to detect structural collapse)
-            t_var = np.var(drift_delta[self.split_idx:])
-            trailing_variances.append(t_var)
-
-        # 4. Apply 3-sigma rule: mean ± 3*std captures 99.73% of benign variation
-        self.empirical_mean_drift = float(np.mean(drift_norms))
-        self.empirical_std_drift = float(np.std(drift_norms))
-
-        # Lower bound for SDVC structural collapse detection
-        self.trailing_var_mean = float(np.mean(trailing_variances))
-        self.trailing_var_std = float(np.std(trailing_variances))
-        self.variance_threshold_lower = float(self.trailing_var_mean - (3 * self.trailing_var_std))
-
-        self.calibrated = True
-        self.baseline_locked = True
-        self.baseline_manifest = {
-            "embedding_dim": self.embedding_dim,
-            "trace_count": len(benign_traces),
-            "empirical_mean_drift": self.empirical_mean_drift,
-            "empirical_std_drift": self.empirical_std_drift,
-            "epsilon_threshold": self.epsilon_threshold,
-            "trailing_var_mean": self.trailing_var_mean,
-            "trailing_var_std": self.trailing_var_std,
-            "variance_threshold_lower": self.variance_threshold_lower,
-            "baseline_hash": hashlib.sha256(
-                json.dumps({
-                    "embedding_dim": self.embedding_dim,
-                    "trace_count": len(benign_traces),
-                    "empirical_mean_drift": self.empirical_mean_drift,
-                    "empirical_std_drift": self.empirical_std_drift,
-                    "variance_threshold_lower": self.variance_threshold_lower,
-                    "trailing_var_mean": self.trailing_var_mean,
-                    "trailing_var_std": self.trailing_var_std,
-                }, sort_keys=True).encode("utf-8")
-            ).hexdigest(),
-        }
-        self._record_event("baseline_calibrated", self.baseline_manifest)
-
-        logger.info("✅ Calibration complete")
-        logger.info(f"   Empirical mean drift: {self.empirical_mean_drift:.6f}")
-        logger.info(f"   Empirical std drift: {self.empirical_std_drift:.6f}")
-        logger.info(f"   Epsilon threshold: {self.epsilon_threshold:.6f}")
-        logger.info(f"   Variance lower bound: {self.variance_threshold_lower:.6f}")
-        logger.info(f"   Baseline hash: {self.baseline_manifest['baseline_hash']}")
-
-    def verify_state_invariance(self, target_state_matrix: np.ndarray) -> Tuple[bool, str]:
-        """
-        Evaluate agent runtime state for anomalies.
-
-        Args:
-            target_state_matrix: Current (embedding_dim, embedding_dim) agent state matrix
-
-        Returns:
-            (is_safe, anomaly_class) where:
-            - is_safe: bool, True if state passes all checks
-            - anomaly_class: str, classification of deviation type
-                * "NOMINAL_OR_BENIGN_ADAPTATION" - within expected variance
-                * "EXTREME_BENIGN_DRIFT" - high variance but not malicious
-                * "ADVERSARIAL_SDVC_MUTATION" - structural collapse detected
-
-        Raises:
-            RuntimeError: If called before calibration
-            ValueError: If input has invalid shape or non-finite values
-        """
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine must be calibrated with benign traces before use. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-
-        if target_state_matrix.shape != (self.embedding_dim, self.embedding_dim):
-            raise ValueError(
-                f"Input has shape {target_state_matrix.shape}, "
-                f"expected ({self.embedding_dim}, {self.embedding_dim})"
-            )
-
-        if not np.all(np.isfinite(target_state_matrix)):
-            logger.error("Input contains non-finite values (NaN or Inf)")
-            self._record_event("state_invalid", {
-                "shape": list(target_state_matrix.shape),
-                "reason": "non_finite_input",
-            })
-            return False, "INVALID_INPUT"
-
-        Sing_Y = np.linalg.svd(target_state_matrix, compute_uv=False)
-        expected_alignment = self.T_shared @ self.Sing_X
-        drift_delta = Sing_Y - expected_alignment
-        drift_norm = np.linalg.norm(drift_delta)
-
-        outcome = {
-            "drift_norm": float(drift_norm),
-            "epsilon_threshold": float(self.epsilon_threshold),
-            "trailing_variance": float(np.var(drift_delta[self.split_idx:])),
-            "baseline_hash": self.baseline_manifest.get("baseline_hash"),
-        }
-
-        if drift_norm <= self.epsilon_threshold:
-            self._record_event("state_pass", outcome)
-            return True, "NOMINAL_OR_BENIGN_ADAPTATION"
-
-        trailing_variance = outcome["trailing_variance"]
-
-        if trailing_variance < self.variance_threshold_lower:
-            logger.critical(
-                f"⚠️  ANOMALY DETECTED: Structural collapse signature\n"
-                f"   Drift norm: {drift_norm:.6f} (threshold: {self.epsilon_threshold:.6f})\n"
-                f"   Trailing variance: {trailing_variance:.6f} "
-                f"(lower bound: {self.variance_threshold_lower:.6f})"
-            )
-            outcome["anomaly_class"] = "ADVERSARIAL_SDVC_MUTATION"
-            self._record_event("state_block", outcome)
-            return False, "ADVERSARIAL_SDVC_MUTATION"
-        else:
-            logger.warning(
-                f"⚠️  HIGH DRIFT detected but not classified as malicious\n"
-                f"   Drift norm: {drift_norm:.6f} (threshold: {self.epsilon_threshold:.6f})\n"
-                f"   Trailing variance: {trailing_variance:.6f} (normal)"
-            )
-            outcome["anomaly_class"] = "EXTREME_BENIGN_DRIFT"
-            self._record_event("state_review", outcome)
-            return False, "EXTREME_BENIGN_DRIFT"
-
-    def get_calibration_report(self) -> dict:
-        """
-        Return calibration metadata for transparency and reproducibility.
-        """
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine not yet calibrated. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-
-        return {
-            "embedding_dim": self.embedding_dim,
-            "calibrated": self.calibrated,
-            "empirical_mean_drift": self.empirical_mean_drift,
-            "empirical_std_drift": self.empirical_std_drift,
-            "epsilon_threshold": self.epsilon_threshold,
-            "trailing_var_mean": self.trailing_var_mean,
-            "trailing_var_std": self.trailing_var_std,
-            "sdvc_variance_ceiling": self.trailing_var_mean - (3.0 * self.trailing_var_std),
-            "baseline_manifest": self.baseline_manifest,
-            "baseline_locked": self.baseline_locked,
-        }
-
-"""
-OASF-BEA Master Architecture (v1.5.2) - Core Matrix Validation Engine
-Component: CognitiveImmunityEngine (SVD & Calibrated Energy Proportion Validation)
-License: Open Framework Public Specification (BEA-CAP-1.0)
-"""
-
-import hashlib
-import json
-import logging
-import time
-
-import numpy as np
-
-try:
-    from src.environment_validator import EnvironmentIntegrityValidator
-except Exception:  # pragma: no cover - defensive import fallback
-    EnvironmentIntegrityValidator = None
-
-# Configure telemetry logger
-logging.basicConfig(level=logging.INFO, format='[OASF-TELEMETRY] %(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("OASF_Matrix_Core")
-
-
-class CognitiveImmunityEngine:
-    def __init__(self, embedding_dim: int = 512, audit_log_path: str = None):
-        """
-        Initializes the cognitive immunity core using geometric invariance checks
-        to intercept Self-Directed Value Compromise (SDVC).
-        """
-        self.embedding_dim = embedding_dim
-        self.audit_log_path = audit_log_path or ".arad_audit.log"
-        self.audit_chain = ""
-        self.baseline_manifest = {}
-        self.baseline_locked = False
-
-        # Core operational anchors (derived via historical trace calibration)
-        self.calibrated = False
-        self.T_shared = None
-        self.Sing_X = None
-
-        # Empirical thresholds established during system calibration
-        self.epsilon_threshold = 0.0
-        self.variance_threshold_lower = 0.0
-        self.energy_ratio_floor = 0.0
-        self.split_idx = int(self.embedding_dim * 0.7)  # 70/30 structural partition boundary
-
-        self.environment_validator = None
-        if EnvironmentIntegrityValidator is not None:
-            self.environment_validator = EnvironmentIntegrityValidator(audit_log_path=self.audit_log_path)
-            try:
-                self.environment_validator.snapshot_environment()
-                if not self.environment_validator.verify_environment():
-                    raise RuntimeError("Environment integrity verification failed during bootstrap.")
-            except Exception as exc:  # pragma: no cover - defensive bootstrap guard
-                logger.critical(f"🚨 RUNTIME BOOTSTRAP GUARD: environment integrity failed: {exc}")
-                raise RuntimeError("Execution environment is not trusted. Detection startup aborted.") from exc
-
-        self._record_event("engine_initialized", {
-            "embedding_dim": self.embedding_dim,
-            "audit_log_path": self.audit_log_path,
-        })
-
-    def _record_event(self, event_type: str, details: dict):
-        """Append a chain-hashed audit record for the detector lifecycle."""
-        record = {
-            "ts": int(time.time()),
-            "event": event_type,
-            "details": details,
-            "previous_hash": self.audit_chain,
-        }
-        payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        chain_hash = hashlib.sha256((self.audit_chain + payload).encode("utf-8")).hexdigest()
-        record["chain_hash"] = chain_hash
-        self.audit_chain = chain_hash
-
-        try:
-            with open(self.audit_log_path, 'a', encoding='utf-8') as handle:
-                handle.write(json.dumps(record, sort_keys=True) + '\n')
-        except OSError as exc:
-            logger.warning(f"Unable to write matrix audit log: {exc}")
-
-    def ensure_environment_integrity(self):
-        """
-        Runtime bootstrap guard. Refuses execution if the environment has changed
-        from the trusted baseline captured during engine initialization.
-        """
-        if self.environment_validator is None:
-            logger.warning("Environment validator unavailable; running without pre-flight integrity guard.")
-            return
-
-        try:
-            if not self.environment_validator.verify_environment():
-                raise RuntimeError("Environment integrity verification failed.")
-        except Exception as exc:
-            logger.critical(f"🚨 RUNTIME BOOTSTRAP GUARD: environment drift detected: {exc}")
-            raise RuntimeError("Execution environment drift detected. Aborting validation cycle.") from exc
-
-    def calibrate_baseline_from_traces(self, benign_traces: list):
-        """
-        Calibrates trusted boundaries using historical trace logs from agents
-        operating nominal parameters over extended observation windows.
-        
-        CALIBRATION ATTACK DEFENSES:
-        - MIN_CALIBRATION_TRACES: Prevents history_window shrinking attacks
-        - Epsilon sanity check: Catches artificially inflated thresholds
-        """
-        if self.calibrated and self.baseline_locked:
-            raise RuntimeError(
-                "Baseline already locked. Recalibration would silently modify the trusted baseline. "
-                "Create a new engine instance to begin a fresh calibration window."
-            )
-
-        self.ensure_environment_integrity()
-
-        if not benign_traces:
-            raise ValueError("Calibration requires a non-empty list of historical agent traces.")
-
-        MIN_CALIBRATION_TRACES = 50
-        if len(benign_traces) < MIN_CALIBRATION_TRACES:
-            raise RuntimeError(
-                f"Insufficient calibration data. Minimum {MIN_CALIBRATION_TRACES} traces required. "
-                f"Received {len(benign_traces)}. Possible calibration poisoning attempt (history_window shrink attack)."
-            )
-
-        logger.info(f"Calibrating system telemetry baseline using {len(benign_traces)} historical traces...")
-
-        svd_profiles = [np.linalg.svd(trace, compute_uv=False) for trace in benign_traces]
-        self.Sing_X = np.mean(svd_profiles, axis=0)
-
-        C = np.zeros((self.embedding_dim, self.embedding_dim))
-        for trace in benign_traces:
-            C += trace @ trace.T
-        U_c, _, _ = np.linalg.svd(C / len(benign_traces))
-        self.T_shared = U_c
-
-        drift_norms = []
-        trailing_variances = []
-        energy_ratios = []
-
-        for Sing_Y in svd_profiles:
-            expected_alignment = self.T_shared @ self.Sing_X
-            drift_delta = Sing_Y - expected_alignment
-
-            norm_val = np.linalg.norm(drift_delta)
-            drift_norms.append(norm_val)
-
-            t_var = np.var(drift_delta[self.split_idx:])
-            trailing_variances.append(t_var)
-
-            leading_energy = np.sum(Sing_Y[:self.split_idx])
-            trailing_energy = np.sum(Sing_Y[self.split_idx:])
-            energy_ratio = trailing_energy / (leading_energy + 1e-9)
-            energy_ratios.append(energy_ratio)
-
-        self.epsilon_threshold = float(np.mean(drift_norms) + (3 * np.std(drift_norms)))
-
-        mean_t_var = np.mean(trailing_variances)
-        std_t_var = np.std(trailing_variances)
-        self.variance_threshold_lower = float(mean_t_var - (3 * std_t_var))
-
-        mean_energy_ratio = np.mean(energy_ratios)
-        std_energy_ratio = np.std(energy_ratios)
-        self.energy_ratio_floor = float(mean_energy_ratio - (3 * std_energy_ratio))
-
-        EPSILON_SANITY_LIMIT = 0.15
-        if self.epsilon_threshold > EPSILON_SANITY_LIMIT:
-            logger.critical(
-                f"🚨 CALIBRATION ATTACK DETECTED: epsilon_threshold={self.epsilon_threshold:.6f} exceeds safety limit {EPSILON_SANITY_LIMIT}. "
-                f"Possible benign trace contamination or history_window manipulation attack."
-            )
-            self._record_event("baseline_rejected", {
-                "reason": "epsilon_sanity_limit_exceeded",
-                "epsilon_threshold": float(self.epsilon_threshold),
-                "limit": EPSILON_SANITY_LIMIT,
-            })
-            raise RuntimeError(
-                "Calibration baseline validation failed. Suspected history window manipulation or poisoned benign traces."
-            )
-
-        self.calibrated = True
-        self.baseline_locked = True
-        self.baseline_manifest = {
-            "embedding_dim": self.embedding_dim,
-            "trace_count": len(benign_traces),
-            "epsilon_threshold": float(self.epsilon_threshold),
-            "variance_threshold_lower": float(self.variance_threshold_lower),
-            "energy_ratio_floor": float(self.energy_ratio_floor),
-            "baseline_hash": hashlib.sha256(
-                json.dumps({
-                    "embedding_dim": self.embedding_dim,
-                    "trace_count": len(benign_traces),
-                    "epsilon_threshold": float(self.epsilon_threshold),
-                    "variance_threshold_lower": float(self.variance_threshold_lower),
-                    "energy_ratio_floor": float(self.energy_ratio_floor),
-                }, sort_keys=True).encode("utf-8")
-            ).hexdigest(),
-        }
-        self._record_event("baseline_calibrated", self.baseline_manifest)
-
-        logger.info("✅ Baseline calibration complete. System safety bounds locked.")
-        logger.info(f"-> Epsilon Limit: {self.epsilon_threshold:.6f}")
-        logger.info(f"-> Lower Trailing Variance Floor: {self.variance_threshold_lower:.6f}")
-        logger.info(f"-> Energy Ratio Floor: {self.energy_ratio_floor:.6f}")
-        logger.info(f"-> Baseline Hash: {self.baseline_manifest['baseline_hash']}")
-
-    def verify_state_invariance(self, target_state_matrix: np.ndarray) -> tuple:
-        """
-        Executes inline mathematical validation loop to evaluate active states.
-        Protects against standard drift, structural collapse, and contraction evasion.
-
-        Uses dual-gate verification:
-        - Gate A: Energy Proportion Ratio (catches uniform contraction attempts)
-        - Gate B: Trailing Variance Profile (catches structural collapse)
-
-        :return: (bool (is_safe), str (profile_signature))
-        """
-        self.ensure_environment_integrity()
-
-        if not self.calibrated:
-            raise RuntimeError("Engine must be calibrated with benign traces before use.")
-
-        if target_state_matrix.shape != (self.embedding_dim, self.embedding_dim):
-            raise ValueError(
-                f"Input shape {target_state_matrix.shape} is invalid for embedding_dim={self.embedding_dim}."
-            )
-
-        Sing_Y = np.linalg.svd(target_state_matrix, compute_uv=False)
-
-        expected_alignment = self.T_shared @ self.Sing_X
-        drift_delta = Sing_Y - expected_alignment
-        drift_norm = np.linalg.norm(drift_delta)
-
-        leading_energy = np.sum(Sing_Y[:self.split_idx])
-        trailing_energy = np.sum(Sing_Y[self.split_idx:])
-        energy_ratio = trailing_energy / (leading_energy + 1e-9)
-
-        outcome = {
-            "drift_norm": float(drift_norm),
-            "trailing_variance": float(np.var(drift_delta[self.split_idx:])),
-            "energy_ratio": float(energy_ratio),
-            "epsilon_threshold": float(self.epsilon_threshold),
-            "variance_threshold_lower": float(self.variance_threshold_lower),
-            "energy_ratio_floor": float(self.energy_ratio_floor),
-            "baseline_hash": self.baseline_manifest.get("baseline_hash"),
-        }
-
-        if energy_ratio < self.energy_ratio_floor:
-            logger.critical("⚠️ ADVERSARIAL RATIO COLLAPSE: Uniform contraction attempt caught via calibrated Energy Proportion Gate!")
-            outcome["profile_signature"] = "ADVERSARIAL_CONTRACTION_EVASION"
-            self._record_event("state_block", outcome)
-            return False, "ADVERSARIAL_CONTRACTION_EVASION"
-
-        if drift_norm <= self.epsilon_threshold:
-            self._record_event("state_pass", outcome)
-            return True, "NOMINAL_OR_BENIGN_ADAPTATION"
-
-        trailing_variance = outcome["trailing_variance"]
-
-        if trailing_variance < self.variance_threshold_lower:
-            logger.critical("⚠️ ADVERSARIAL SDVC SIGNATURE DETECTED: Sudden structural matrix collapse!")
-            outcome["profile_signature"] = "ADVERSARIAL_SDVC_MUTATION"
-            self._record_event("state_block", outcome)
-            return False, "ADVERSARIAL_SDVC_MUTATION"
-        else:
-            logger.warning("🚨 HIGH VARIANCE VARIATION: Continuous learning domain adaptation profile detected.")
-            outcome["profile_signature"] = "EXTREME_BENIGN_DRIFT"
-            self._record_event("state_review", outcome)
-            return False, "EXTREME_BENIGN_DRIFT"
-
-    def get_calibration_report(self):
-        """Return calibration metadata for transparency and reproducibility."""
-        if not self.calibrated:
-            raise RuntimeError("Engine must be calibrated with benign traces before use.")
-
-        return {
-            "embedding_dim": self.embedding_dim,
-            "calibrated": self.calibrated,
-            "epsilon_threshold": float(self.epsilon_threshold),
-            "variance_threshold_lower": float(self.variance_threshold_lower),
-            "energy_ratio_floor": float(self.energy_ratio_floor),
-            "baseline_manifest": self.baseline_manifest,
-            "baseline_locked": self.baseline_locked,
-        }
-
-
-if __name__ == "__main__":
-    logger.info("Running engine infrastructure verification loop...")
-    engine = CognitiveImmunityEngine(embedding_dim=512)
-
-    nominal_historical_traces = [np.eye(512) + np.random.normal(loc=0, scale=0.001, size=(512, 512)) for _ in range(100)]
-    engine.calibrate_baseline_from_traces(nominal_historical_traces)
-
-    test_trace = np.eye(512)
-    safe, profile = engine.verify_state_invariance(test_trace)
-    logger.info(f"Result: safe={safe}, profile={profile}")
-
-
-"""
-CognitiveImmunityEngine: Core anomaly detection module
-Based on SVD-driven structural invariance checking
-"""
-
-import numpy as np
-import logging
-from typing import Tuple, List
-
-logging.basicConfig(level=logging.INFO, format='[ARAD] %(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ARAD_Detector")
-
-
-class CognitiveImmunityEngine:
-    """
-    Runtime anomaly detector for autonomous agent state monitoring.
-    Detects structural deviations that indicate compromise or self-modification.
-    """
-
-    def __init__(self, embedding_dim: int = 512):
-        """
-        Initialize the detector.
-
-        Args:
-            embedding_dim: Dimensionality of agent state matrices (default 512)
-        """
-        self.embedding_dim = embedding_dim
-
-        # Calibration state
-        self.calibrated = False
-        self.T_shared = None
-        self.Sing_X = None
-
-        # Empirical calibration statistics
-        self.empirical_mean_drift = 0.0
-        self.empirical_std_drift = 0.0
-        self.trailing_var_mean = 0.0
-        self.trailing_var_std = 0.0
-
-        # Derived detector thresholds
-        self.variance_threshold_lower = 0.0
-        self.split_idx = int(self.embedding_dim * 0.7)  # 70/30 split for variance analysis
-
-    @property
-    def epsilon_threshold(self) -> float:
-        """Computed threshold: mean + 3σ of empirical drift distribution."""
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine not yet calibrated. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-        return self.empirical_mean_drift + (3.0 * self.empirical_std_drift)
-
-    def calibrate_baseline_from_traces(self, benign_traces: List[np.ndarray]) -> None:
-        """
-        Calibrate detection thresholds from real benign agent traces.
-        This MUST be called before verify_state_invariance().
-
-        Args:
-            benign_traces: List of (embedding_dim, embedding_dim) state matrices from clean operation
-
-        Raises:
-            ValueError: If traces have invalid shape or insufficient data
-        """
-        if not benign_traces:
-            raise ValueError("At least 1 benign trace required for calibration")
-
-        if len(benign_traces) < 10:
-            logger.warning(
-                f"Calibrating on only {len(benign_traces)} traces. "
-                f"Recommend 50+ for robust thresholds."
-            )
-
-        # Validate all traces
-        for i, trace in enumerate(benign_traces):
-            if trace.shape != (self.embedding_dim, self.embedding_dim):
-                raise ValueError(
-                    f"Trace {i} has shape {trace.shape}, expected "
-                    f"({self.embedding_dim}, {self.embedding_dim})"
-                )
-            if not np.all(np.isfinite(trace)):
-                raise ValueError(f"Trace {i} contains non-finite values (NaN or Inf)")
-
-        logger.info(f"Calibrating on {len(benign_traces)} benign traces...")
-
-        # 1. Derive Sing_X: average singular value profile from benign operation
-        svd_profiles = [np.linalg.svd(trace, compute_uv=False) for trace in benign_traces]
-        self.Sing_X = np.mean(svd_profiles, axis=0)
-
-        # 2. Compute T_shared: transformation matrix from covariance structure
-        C = np.zeros((self.embedding_dim, self.embedding_dim))
-        for trace in benign_traces:
-            C += trace @ trace.T
-        C /= len(benign_traces)
-
-        U_c, _, _ = np.linalg.svd(C)
-        self.T_shared = U_c  # Use left singular vectors as transformation
-
-        # 3. Compute drift statistics for threshold calibration
-        drift_norms = []
-        trailing_variances = []
-
-        for Sing_Y in svd_profiles:
-            expected_alignment = self.T_shared @ self.Sing_X
-            drift_delta = Sing_Y - expected_alignment
-
-            # Euclidean norm of drift vector
-            norm_val = np.linalg.norm(drift_delta)
-            drift_norms.append(norm_val)
-
-            # Variance in trailing dimensions (used to detect structural collapse)
-            t_var = np.var(drift_delta[self.split_idx:])
-            trailing_variances.append(t_var)
-
-        # 4. Apply 3-sigma rule: mean ± 3*std captures 99.73% of benign variation
-        self.empirical_mean_drift = float(np.mean(drift_norms))
-        self.empirical_std_drift = float(np.std(drift_norms))
-
-        # Lower bound for SDVC structural collapse detection
-        self.trailing_var_mean = float(np.mean(trailing_variances))
-        self.trailing_var_std = float(np.std(trailing_variances))
-        self.variance_threshold_lower = float(self.trailing_var_mean - (3 * self.trailing_var_std))
-
-        self.calibrated = True
-        logger.info("✅ Calibration complete")
-        logger.info(f"   Empirical mean drift: {self.empirical_mean_drift:.6f}")
-        logger.info(f"   Empirical std drift: {self.empirical_std_drift:.6f}")
-        logger.info(f"   Epsilon threshold: {self.epsilon_threshold:.6f}")
-        logger.info(f"   Variance lower bound: {self.variance_threshold_lower:.6f}")
-
-    def verify_state_invariance(self, target_state_matrix: np.ndarray) -> Tuple[bool, str]:
-        """
-        Evaluate agent runtime state for anomalies.
-
-        Args:
-            target_state_matrix: Current (embedding_dim, embedding_dim) agent state matrix
-
-        Returns:
-            (is_safe, anomaly_class) where:
-            - is_safe: bool, True if state passes all checks
-            - anomaly_class: str, classification of deviation type
-                * "NOMINAL_OR_BENIGN_ADAPTATION" - within expected variance
-                * "EXTREME_BENIGN_DRIFT" - high variance but not malicious
-                * "ADVERSARIAL_SDVC_MUTATION" - structural collapse detected
-
-        Raises:
-            RuntimeError: If called before calibration
-            ValueError: If input has invalid shape or non-finite values
-        """
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine must be calibrated with benign traces before use. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-
-        # Validate input
-        if target_state_matrix.shape != (self.embedding_dim, self.embedding_dim):
-            raise ValueError(
-                f"Input has shape {target_state_matrix.shape}, "
-                f"expected ({self.embedding_dim}, {self.embedding_dim})"
-            )
-
-        if not np.all(np.isfinite(target_state_matrix)):
-            logger.error("Input contains non-finite values (NaN or Inf)")
-            return False, "INVALID_INPUT"
-
-        # Compute singular values
-        Sing_Y = np.linalg.svd(target_state_matrix, compute_uv=False)
-
-        # Calculate structural drift
-        expected_alignment = self.T_shared @ self.Sing_X
-        drift_delta = Sing_Y - expected_alignment
-
-        # Frobenius norm (Euclidean distance)
-        drift_norm = np.linalg.norm(drift_delta)
-
-        # Primary check: overall drift magnitude
-        if drift_norm <= self.epsilon_threshold:
-            return True, "NOMINAL_OR_BENIGN_ADAPTATION"
-
-        # Secondary check: trailing variance (indicates structural collapse)
-        trailing_variance = np.var(drift_delta[self.split_idx:])
-
-        if trailing_variance < self.variance_threshold_lower:
-            logger.critical(
-                f"⚠️  ANOMALY DETECTED: Structural collapse signature\n"
-                f"   Drift norm: {drift_norm:.6f} (threshold: {self.epsilon_threshold:.6f})\n"
-                f"   Trailing variance: {trailing_variance:.6f} "
-                f"(lower bound: {self.variance_threshold_lower:.6f})"
-            )
-            return False, "ADVERSARIAL_SDVC_MUTATION"
-        else:
-            logger.warning(
-                f"⚠️  HIGH DRIFT detected but not classified as malicious\n"
-                f"   Drift norm: {drift_norm:.6f} (threshold: {self.epsilon_threshold:.6f})\n"
-                f"   Trailing variance: {trailing_variance:.6f} (normal)"
-            )
-            return False, "EXTREME_BENIGN_DRIFT"
-
-    def get_calibration_report(self) -> dict:
-        """
-        Return calibration metadata for transparency and reproducibility.
-        """
-        if not self.calibrated:
-            raise RuntimeError(
-                "Engine not yet calibrated. "
-                "Call calibrate_baseline_from_traces() first."
-            )
-
-        return {
-            "embedding_dim": self.embedding_dim,
-            "calibrated": self.calibrated,
-            "empirical_mean_drift": self.empirical_mean_drift,
-            "empirical_std_drift": self.empirical_std_drift,
-            "epsilon_threshold": self.epsilon_threshold,
-            "trailing_var_mean": self.trailing_var_mean,
-            "trailing_var_std": self.trailing_var_std,
-            "sdvc_variance_ceiling": self.trailing_var_mean - (3.0 * self.trailing_var_std),
-        }
-
-"""}]},
