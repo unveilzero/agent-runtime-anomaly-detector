@@ -1,11 +1,7 @@
-"""Environment preflight checks.
-
-This is a preflight integrity check, not a complete external monitor. It verifies
-that the in-process environment has not drifted from an earlier baseline, but it
-cannot prove there are no side effects outside the Python process itself.
-"""
+"""Preflight integrity checks for selected modules and environment variables."""
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -17,7 +13,7 @@ logger = logging.getLogger("OASF_Environment_Validator")
 
 
 class EnvironmentIntegrityValidator:
-    """Fingerprint selected loaded modules and environment variables."""
+    """Capture and verify a local baseline for selected runtime inputs."""
 
     CRITICAL_MODULES = ("numpy", "scipy")
     SAFE_ENV_VARS = {"PATH": None, "PYTHONPATH": None, "LD_LIBRARY_PATH": None}
@@ -30,83 +26,64 @@ class EnvironmentIntegrityValidator:
         if safe_env_vars:
             self._safe_env_vars.update(safe_env_vars)
         self.audit_log = AuditLog(audit_log_path or ".arad_environment_audit.jsonl")
-        self._record_event("validator_initialized", {
-            "critical_modules": list(self.CRITICAL_MODULES),
-            "safe_env_vars": sorted(self._safe_env_vars),
-        })
 
     def _record_event(self, event_type, details):
-        try:
-            self.audit_log.append(event_type, details)
-        except (OSError, ValueError):
-            logger.exception("Environment audit logging failed")
+        self.audit_log.append(event_type, details)
 
     def snapshot_environment(self):
-        self.baseline_imports = {}
+        if self.environment_manifest:
+            raise RuntimeError("Environment baseline already captured; create a new validator to recapture it.")
         for module_name in self.CRITICAL_MODULES:
-            module = sys.modules.get(module_name)
-            module_path = getattr(module, "__file__", None) if module else None
-            if not module_path:
-                continue
             try:
+                module = importlib.import_module(module_name)
+                module_path = getattr(module, "__file__", None)
+                if not module_path:
+                    raise RuntimeError(f"Cannot determine module file for {module_name}")
                 with open(module_path, "rb") as handle:
                     module_hash = hashlib.sha256(handle.read()).hexdigest()
-                self.baseline_imports[module_name] = {"path": module_path, "hash": module_hash}
-            except OSError as exc:
-                logger.warning("Could not fingerprint %s: %s", module_name, exc)
+            except (ImportError, OSError, RuntimeError) as exc:
+                raise RuntimeError(f"Unable to capture module baseline for {module_name}") from exc
+            self.baseline_imports[module_name] = {"path": module_path, "hash": module_hash}
 
         self.baseline_env_vars = {name: os.environ.get(name, "") for name in self._safe_env_vars}
-        manifest = {"imports": self.baseline_imports, "env": self.baseline_env_vars}
-        self.environment_manifest = {
+        public_manifest = {
             "module_fingerprints": self.baseline_imports,
             "env_var_names": sorted(self.baseline_env_vars),
-            "baseline_hash": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest(),
+            "env_var_hashes": {name: hashlib.sha256(value.encode("utf-8")).hexdigest()
+                                for name, value in self.baseline_env_vars.items()},
         }
+        self.environment_manifest = dict(
+            public_manifest,
+            baseline_hash=hashlib.sha256(
+                json.dumps(public_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        )
         self._record_event("environment_snapshot", self.environment_manifest)
         return dict(self.environment_manifest)
 
-    def verify_environment(self):
+    def verify_environment(self) -> bool:
         if not self.environment_manifest:
             raise RuntimeError("Call snapshot_environment() before verify_environment().")
-
         for module_name, baseline in self.baseline_imports.items():
             module = sys.modules.get(module_name)
             actual_path = getattr(module, "__file__", None) if module else None
             if actual_path != baseline["path"]:
-                self._record_event("environment_mismatch", {
-                    "module": module_name,
-                    "reason": "path_mismatch",
-                    "actual_path": actual_path,
-                })
+                self._record_event("environment_mismatch", {"module": module_name, "reason": "path_mismatch"})
                 return False
             try:
                 with open(actual_path, "rb") as handle:
                     actual_hash = hashlib.sha256(handle.read()).hexdigest()
-            except OSError as exc:
-                self._record_event("environment_mismatch", {
-                    "module": module_name,
-                    "reason": "read_error",
-                    "error": str(exc),
-                })
+            except OSError:
+                self._record_event("environment_mismatch", {"module": module_name, "reason": "read_error"})
                 return False
             if actual_hash != baseline["hash"]:
-                self._record_event("environment_mismatch", {
-                    "module": module_name,
-                    "reason": "hash_mismatch",
-                })
+                self._record_event("environment_mismatch", {"module": module_name, "reason": "hash_mismatch"})
                 return False
-
         for name, expected in self.baseline_env_vars.items():
             if os.environ.get(name, "") != expected:
-                self._record_event("environment_mismatch", {
-                    "variable": name,
-                    "reason": "env_var_mismatch",
-                })
+                self._record_event("environment_mismatch", {"variable": name, "reason": "value_mismatch"})
                 return False
-
-        self._record_event("environment_verified", {
-            "baseline_hash": self.environment_manifest["baseline_hash"],
-        })
+        self._record_event("environment_verified", {"baseline_hash": self.environment_manifest["baseline_hash"]})
         return True
 
 
