@@ -30,9 +30,7 @@ def test_recalibration_requires_new_engine(calibrated_engine):
 
 
 def test_nominal_state_passes(calibrated_engine):
-    # A fresh sample from the calibration distribution. A noise-free np.eye(8)
-    # is not nominal: its profile lacks the singular-value spread every
-    # calibration trace has, and the corrected threshold is tight enough to see it.
+    # A fresh sample from the calibration distribution.
     state = np.eye(8) + np.random.default_rng(999).normal(0, 0.001, (8, 8))
     safe, profile = calibrated_engine[0].verify_state_invariance(state)
     assert safe and profile == "NOMINAL_OR_BENIGN_ADAPTATION"

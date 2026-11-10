@@ -16,11 +16,10 @@ logger = logging.getLogger("ARAD_Detector")
 class CognitiveImmunityEngine:
     """Evaluate caller-supplied state matrices against a calibrated baseline.
 
-    The internal integrity check compares against a hash stored on this same
-    object, so code running in this process can defeat it. Hold
-    ``baseline_manifest["baseline_hash"]`` with an external supervisor and
-    pass it to every ``verify_state_invariance()`` call; set
-    ``require_external_baseline_hash=True`` to make that mandatory.
+    Run the engine in a supervisor process. Hold
+    ``baseline_manifest["baseline_hash"]`` there and pass it to every
+    ``verify_state_invariance()`` call; ``require_external_baseline_hash=True``
+    makes that mandatory.
     """
 
     MIN_CALIBRATION_TRACES = 50

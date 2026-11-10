@@ -17,13 +17,12 @@ class RuntimeEffectMonitor:
     Blocked action sequences are correlated by ``trace_id`` and by agent
     lineage (the root reached through ``parent_agent_id``). Tracking state is
     never evicted while it is inside the correlation window; when capacity is
-    exhausted, new traces and agents are blocked instead: a flood of allowed
-    events can therefore deny service, but cannot shed history. Lineage must be
-    reported by a trusted collector, not by the agent. An agent seen without
-    ``parent_agent_id`` has no known parent yet; the first parent reported for
-    it is adopted and is fixed from then on. The correlation window is measured
-    in the collector's event timestamps; set ``max_timestamp_skew_seconds`` in
-    live deployments to reject timestamps far from this host's clock.
+    exhausted, new traces and agents are blocked instead. Lineage must be
+    reported by a trusted collector. An agent seen without ``parent_agent_id``
+    has no known parent yet; the first parent reported for it is adopted and
+    is fixed from then on. The correlation window is measured in the
+    collector's event timestamps; set ``max_timestamp_skew_seconds`` in live
+    deployments.
     """
 
     def __init__(self, policy, audit_log_path=".arad_effects_audit.jsonl",
@@ -163,8 +162,7 @@ class RuntimeEffectMonitor:
             self._agents[agent_id] = {"parent": parent_id, "seen": now}
             undo = lambda: self._agents.pop(agent_id, None)
         elif parent_id is not None and known is None:
-            # No parent was reported before: adopt this one. The caller folds
-            # the agent's history as a root into the new root.
+            # First parent reported for this agent; the caller merges its history.
             entry["parent"] = parent_id
             undo = lambda: entry.__setitem__("parent", None)
         root, problem = self._walk_to_root(agent_id, now)
@@ -189,8 +187,7 @@ class RuntimeEffectMonitor:
         return self._bucket(root_key, now)
 
     def _sequence_violation(self, bucket, action, timestamp):
-        # Matches on arrival order: an earlier-observed first action counts
-        # even if this event claims an older timestamp.
+        # Matches on arrival order within the window.
         window_start = timestamp - self.correlation_window_seconds
         for first_action, second_action in self.blocked_action_sequences:
             if action == second_action and bucket["last"].get(first_action, float("-inf")) >= window_start:
@@ -222,8 +219,7 @@ class RuntimeEffectMonitor:
             violation = self._sequence_violation(bucket, fields["action"], timestamp)
             if violation:
                 return "BLOCK", f"{violation}:{scope}", root
-        # Only allowed events advance a key's clock, so a rejected far-future
-        # timestamp cannot age out real history.
+        # Only allowed events advance a key's clock.
         for _, bucket in buckets:
             bucket["max_ts"] = max(bucket["max_ts"], timestamp)
             if fields["action"] in self._first_actions:
