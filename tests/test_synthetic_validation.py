@@ -8,7 +8,8 @@ from src import CognitiveImmunityEngine
 
 @pytest.fixture
 def calibrated_engine(tmp_path):
-    engine = CognitiveImmunityEngine(embedding_dim=8, audit_log_path=tmp_path / "detector.jsonl")
+    engine = CognitiveImmunityEngine(embedding_dim=8, audit_log_path=tmp_path / "detector.jsonl",
+                                     min_calibration_traces=10)
     traces = [np.eye(8) + np.random.default_rng(seed).normal(0, 0.001, (8, 8)) for seed in range(10)]
     engine.calibrate_baseline_from_traces(traces)
     return engine, traces
@@ -29,7 +30,11 @@ def test_recalibration_requires_new_engine(calibrated_engine):
 
 
 def test_nominal_state_passes(calibrated_engine):
-    safe, profile = calibrated_engine[0].verify_state_invariance(np.eye(8))
+    # A fresh sample from the calibration distribution. A noise-free np.eye(8)
+    # is not nominal: its profile lacks the singular-value spread every
+    # calibration trace has, and the corrected threshold is tight enough to see it.
+    state = np.eye(8) + np.random.default_rng(999).normal(0, 0.001, (8, 8))
+    safe, profile = calibrated_engine[0].verify_state_invariance(state)
     assert safe and profile == "NOMINAL_OR_BENIGN_ADAPTATION"
 
 
@@ -48,10 +53,11 @@ def test_input_shape_and_values_are_validated(calibrated_engine):
 
 
 def test_calibration_rejects_bad_traces(tmp_path):
-    engine = CognitiveImmunityEngine(embedding_dim=8, audit_log_path=tmp_path / "detector.jsonl")
+    engine = CognitiveImmunityEngine(embedding_dim=8, audit_log_path=tmp_path / "detector.jsonl",
+                                     min_calibration_traces=2)
     with pytest.raises(ValueError, match="shape"):
-        engine.calibrate_baseline_from_traces([np.eye(4)])
+        engine.calibrate_baseline_from_traces([np.eye(8), np.eye(4)])
     invalid = np.eye(8)
     invalid[0, 0] = np.inf
     with pytest.raises(ValueError, match="non-finite"):
-        engine.calibrate_baseline_from_traces([invalid])
+        engine.calibrate_baseline_from_traces([np.eye(8), invalid])
