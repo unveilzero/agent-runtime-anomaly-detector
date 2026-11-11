@@ -12,9 +12,10 @@ validator.snapshot_environment()
 if not validator.verify_environment():
     raise RuntimeError("Environment integrity check failed")
 
-engine = CognitiveImmunityEngine(embedding_dim=512)
+engine = CognitiveImmunityEngine(embedding_dim=512, require_external_baseline_hash=True)
 engine.calibrate_baseline_from_traces(benign_traces)
-safe, profile = engine.verify_state_invariance(target_state_matrix)
+baseline_hash = engine.baseline_manifest["baseline_hash"]  # store with the supervisor
+safe, profile = engine.verify_state_invariance(target_state_matrix, expected_baseline_hash=baseline_hash)
 if not safe:
     raise RuntimeError(f"State evaluation requires handling: {profile}")
 ```

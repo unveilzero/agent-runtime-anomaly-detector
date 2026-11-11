@@ -119,7 +119,7 @@ def test_idle_entries_are_evicted_after_the_window(tmp_path):
 def test_rerooting_keeps_lineage_history(tmp_path):
     monitor = _sequence_monitor(tmp_path)
     monitor.evaluate_event(_event("t1", "a", "SENSITIVE_READ", 1, parent_agent_id="b"))
-    monitor.evaluate_event(_event("t2", "b", "OUTBOUND_CONNECT", 2, parent_agent_id="c"))
+    assert monitor.evaluate_event(_event("t2", "b", "SENSITIVE_READ", 2, parent_agent_id="c"))["decision"] == "ALLOW"
     hop = monitor.evaluate_event(_event("t3", "a", "OUTBOUND_CONNECT", 3))
     assert hop["decision"] == "BLOCK" and hop["lineage_root"] == "c"
 
@@ -275,6 +275,52 @@ def test_timestamp_skew_limit_blocks_forward_dated_events(tmp_path):
 def test_blocked_sequences_must_be_string_pairs(tmp_path, sequences):
     with pytest.raises(ValueError, match="string pairs"):
         RuntimeEffectMonitor({}, audit_log_path=tmp_path / "effects.jsonl", blocked_action_sequences=sequences)
+
+
+def _tracking_snapshot(monitor):
+    return ({agent: entry["parent"] for agent, entry in monitor._agents.items()},
+            {key: (dict(bucket["last"]), bucket["max_ts"]) for key, bucket in monitor._history.items()})
+
+
+@pytest.mark.parametrize("rejected, reason", [
+    (dict(trace="t1", agent="new", action="OUTBOUND_CONNECT", timestamp=101, parent_agent_id="a"),
+     "correlated_actions:SENSITIVE_READ->OUTBOUND_CONNECT:trace"),
+    (dict(trace="t-new", agent="new", action="OUTBOUND_CONNECT", timestamp=101, parent_agent_id="a"),
+     "correlated_actions:SENSITIVE_READ->OUTBOUND_CONNECT:lineage"),
+    (dict(trace="t1", agent="new", action="SENSITIVE_READ", timestamp=50, parent_agent_id="other"),
+     "non_monotonic_trace_timestamp"),
+    (dict(trace="t-new", agent="new", action="SENSITIVE_READ", timestamp=-900, parent_agent_id="a"),
+     "stale_lineage_timestamp"),
+    (dict(trace="t-new", agent="b", action="OUTBOUND_CONNECT", timestamp=101, parent_agent_id="a"),
+     "correlated_actions:SENSITIVE_READ->OUTBOUND_CONNECT:lineage"),
+])
+def test_rejected_events_leave_tracking_state_unchanged(tmp_path, rejected, reason):
+    monitor = _bounded_monitor(tmp_path, _Clock())
+    monitor.evaluate_event(_event("t1", "a", "SENSITIVE_READ", 100))
+    monitor.evaluate_event(_event("t-b", "b", "NOOP", 100))          # b: parent not known yet
+    before = _tracking_snapshot(monitor)
+    result = monitor.evaluate_event(_event(**rejected))
+    assert (result["decision"], result["reason"]) == ("BLOCK", reason)
+    assert _tracking_snapshot(monitor) == before
+    # The rejected parent claim reserved nothing: the same agent can still report its real parent.
+    later = monitor.evaluate_event(_event("t-later", rejected["agent"], "NOOP", 102, parent_agent_id="real"))
+    assert later["decision"] == "ALLOW" and later["lineage_root"] == "real"
+
+
+def test_history_held_before_a_late_parent_still_counts(tmp_path):
+    monitor = _sequence_monitor(tmp_path)
+    monitor.evaluate_event(_event("t1", "a", "SENSITIVE_READ", 1))
+    hop = monitor.evaluate_event(_event("t2", "a", "OUTBOUND_CONNECT", 2, parent_agent_id="fresh"))
+    assert hop["reason"].endswith(":lineage")
+    assert monitor._agents["a"]["parent"] is None and ("lineage", "a") in monitor._history
+
+
+def test_oversized_timestamp_is_blocked_and_audited(tmp_path):
+    monitor = _sequence_monitor(tmp_path)
+    result = monitor.evaluate_event(_event("t1", "a", "OUTBOUND_CONNECT", 10 ** 400))
+    assert (result["decision"], result["reason"]) == ("BLOCK", "invalid_timestamp")
+    assert not monitor._agents and not monitor._history
+    assert monitor.verify_audit_log()["records"] == 1
 
 
 # Audit log: keys and anchors

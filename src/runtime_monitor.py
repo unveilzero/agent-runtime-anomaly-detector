@@ -171,56 +171,66 @@ class RuntimeEffectMonitor:
             undo = None
         return root, problem, undo
 
-    def _lineage_bucket(self, root, agent_id, now):
-        """Return the root's bucket, first folding in history the agent held as an implicit root."""
-        orphan_key, root_key = ("lineage", agent_id), ("lineage", root)
-        if orphan_key != root_key and orphan_key in self._history:
-            orphan = self._history.pop(orphan_key)
-            target = self._history.get(root_key)
-            if target is None:
-                # Re-key in place: the freed slot is reused, so this cannot fail at capacity.
-                self._history[root_key] = orphan
-            else:
-                for action, ts in orphan["last"].items():
-                    target["last"][action] = max(ts, target["last"].get(action, float("-inf")))
-                target["max_ts"] = max(target["max_ts"], orphan["max_ts"])
-        return self._bucket(root_key, now)
-
-    def _sequence_violation(self, bucket, action, timestamp):
+    def _sequence_violation(self, buckets, action, timestamp):
         # Matches on arrival order within the window.
         window_start = timestamp - self.correlation_window_seconds
         for first_action, second_action in self.blocked_action_sequences:
-            if action == second_action and bucket["last"].get(first_action, float("-inf")) >= window_start:
+            if action != second_action:
+                continue
+            if any(bucket["last"].get(first_action, float("-inf")) >= window_start for bucket in buckets):
                 return f"correlated_actions:{first_action}->{second_action}"
         return None
 
     def _correlate(self, fields, timestamp):
+        """Check the event against tracked history; only an allowed event changes that history."""
         now = self._clock()
         agent_id, trace_key = fields["agent_id"], ("trace", fields["trace_id"])
         root, problem, undo_lineage = self._resolve_lineage(agent_id, fields.get("parent_agent_id"), now)
         if problem:
             return "BLOCK", problem, None
+        root_key, orphan_key = ("lineage", root), ("lineage", agent_id)
+        # History this agent holds as a root of its own counts toward its new
+        # lineage, and is merged into it once the event is allowed.
+        orphan = self._history.get(orphan_key) if orphan_key != root_key else None
         new_trace = trace_key not in self._history
+        new_lineage = orphan is None and root_key not in self._history
         trace_bucket = self._bucket(trace_key, now)
-        lineage_bucket = self._lineage_bucket(root, agent_id, now) if trace_bucket is not None else None
-        if lineage_bucket is None:
-            # Out of capacity: undo this event's registrations so it leaves no trace.
+        lineage_bucket = None
+        if trace_bucket is not None and (new_lineage or root_key in self._history):
+            lineage_bucket = self._bucket(root_key, now)
+
+        def reject(reason):
             if undo_lineage:
                 undo_lineage()
             if new_trace and trace_bucket is not None:
                 del self._history[trace_key]
-            return "BLOCK", "history_capacity_exceeded", root
+            if new_lineage and lineage_bucket is not None:
+                del self._history[root_key]
+            return "BLOCK", reason, root
+
+        if trace_bucket is None or (new_lineage and lineage_bucket is None):
+            return reject("history_capacity_exceeded")
+        lineage_view = [bucket for bucket in (lineage_bucket, orphan) if bucket is not None]
         if timestamp < trace_bucket["max_ts"]:
-            return "BLOCK", "non_monotonic_trace_timestamp", root
-        if timestamp < lineage_bucket["max_ts"] - self.correlation_window_seconds:
-            return "BLOCK", "stale_lineage_timestamp", root
-        buckets = (("trace", trace_bucket), ("lineage", lineage_bucket))
-        for scope, bucket in buckets:
-            violation = self._sequence_violation(bucket, fields["action"], timestamp)
+            return reject("non_monotonic_trace_timestamp")
+        if timestamp < max(bucket["max_ts"] for bucket in lineage_view) - self.correlation_window_seconds:
+            return reject("stale_lineage_timestamp")
+        for scope, buckets in (("trace", [trace_bucket]), ("lineage", lineage_view)):
+            violation = self._sequence_violation(buckets, fields["action"], timestamp)
             if violation:
-                return "BLOCK", f"{violation}:{scope}", root
-        # Only allowed events advance a key's clock.
-        for _, bucket in buckets:
+                return reject(f"{violation}:{scope}")
+
+        if orphan is not None:
+            del self._history[orphan_key]
+            if lineage_bucket is None:
+                # Re-key in place: the freed slot is reused, so no capacity is needed.
+                orphan["seen"] = now
+                self._history[root_key] = lineage_bucket = orphan
+            else:
+                for action, ts in orphan["last"].items():
+                    lineage_bucket["last"][action] = max(ts, lineage_bucket["last"].get(action, float("-inf")))
+                lineage_bucket["max_ts"] = max(lineage_bucket["max_ts"], orphan["max_ts"])
+        for bucket in (trace_bucket, lineage_bucket):
             bucket["max_ts"] = max(bucket["max_ts"], timestamp)
             if fields["action"] in self._first_actions:
                 bucket["last"][fields["action"]] = max(
@@ -237,7 +247,10 @@ class RuntimeEffectMonitor:
             timestamp = fields.get("timestamp", wall_clock)
             if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
                 timestamp = float("nan")
-            timestamp = float(timestamp)
+            try:
+                timestamp = float(timestamp)
+            except OverflowError:
+                timestamp = float("nan")
             if not math.isfinite(timestamp):
                 decision, reason = "BLOCK", "invalid_timestamp"
             elif (self.max_timestamp_skew_seconds is not None
